@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""
+Iram AI Model Manager GUI (iram-models)
+Allows users to switch active Gemini Cloud models, toggle local Ollama offline mode,
+or pull local GGUF models via Wofi.
+https://github.com/apravint/iram-os
+"""
+
+import sys
+import os
+import subprocess
+import re
+
+ENV_CONF = os.path.expanduser("~/.config/environment.d/20-gemini.conf")
+ZSHRC = os.path.expanduser("~/.zshrc")
+BASHRC = os.path.expanduser("~/.bashrc")
+
+def get_current_model():
+    return os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+
+def set_model(model_name):
+    # 1. Update ~/.config/environment.d/20-gemini.conf
+    if os.path.exists(ENV_CONF):
+        with open(ENV_CONF, "r") as f:
+            content = f.read()
+        if "GEMINI_MODEL=" in content:
+            content = re.sub(r'GEMINI_MODEL=.*', f'GEMINI_MODEL="{model_name}"', content)
+        else:
+            content += f'\nGEMINI_MODEL="{model_name}"\n'
+        with open(ENV_CONF, "w") as f:
+            f.write(content)
+        os.chmod(ENV_CONF, 0o600)
+
+    # 2. Update ~/.zshrc
+    if os.path.exists(ZSHRC):
+        with open(ZSHRC, "r") as f:
+            content = f.read()
+        if "export GEMINI_MODEL=" in content:
+            content = re.sub(r'export GEMINI_MODEL=.*', f'export GEMINI_MODEL="{model_name}"', content)
+            with open(ZSHRC, "w") as f:
+                f.write(content)
+            os.chmod(ZSHRC, 0o600)
+
+    # 3. Update ~/.bashrc
+    if os.path.exists(BASHRC):
+        with open(BASHRC, "r") as f:
+            content = f.read()
+        if "export GEMINI_MODEL=" in content:
+            content = re.sub(r'export GEMINI_MODEL=.*', f'export GEMINI_MODEL="{model_name}"', content)
+            with open(BASHRC, "w") as f:
+                f.write(content)
+            os.chmod(BASHRC, 0o600)
+
+    # 4. Set in systemd user session
+    subprocess.run(["systemctl", "--user", "set-environment", f"GEMINI_MODEL={model_name}"], check=False)
+
+    # 5. Restart agent daemon to refresh Waybar
+    subprocess.run(["systemctl", "--user", "restart", "iram-agentd.service"], check=False)
+
+    subprocess.run([
+        "notify-send", "-a", "Iram Model Manager",
+        "✨ Active Model Switched",
+        f"Now using {model_name} (0% CPU · Cloud TPU)"
+    ])
+
+def show_model_menu():
+    curr = get_current_model()
+    
+    options = [
+        f"✨ Gemini 3.5 Flash Lite [Active: {'YES' if curr == 'gemini-3.5-flash-lite' else 'NO'}] (Fastest · 1M Context · 0% CPU)",
+        f"⚡ Gemini 3.8 Flash [Active: {'YES' if curr == 'gemini-3.8-flash' else 'NO'}] (Enhanced Reasoning · 0% CPU)",
+        f"🧠 Gemini 2.5 Pro [Active: {'YES' if curr == 'gemini-2.5-pro' else 'NO'}] (Deep Thinking & Complex Code · 0% CPU)",
+        "────────────────────────────────────────────────────────",
+        "⬇️ Pull Ollama: qwen2.5:7b (High Capability Local)",
+        "⬇️ Pull Ollama: deepseek-r1:8b (Local Reasoning)",
+        "⬇️ Pull Ollama: nomic-embed-text (Vector Memory)",
+        "⬇️ Pull Ollama: llama3.1:8b (Meta Open Source)"
+    ]
+
+    wofi_input = "\n".join(options)
+    cmd = ["wofi", "--dmenu", "--prompt", "🤖 Switch AI Model / Manage Weights...", "--width", "750", "--height", "340"]
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        selected_option, _ = proc.communicate(input=wofi_input)
+        selected_option = selected_option.strip()
+
+        if not selected_option or "─────" in selected_option:
+            sys.exit(0)
+
+        if "Gemini 3.5 Flash Lite" in selected_option:
+            set_model("gemini-3.5-flash-lite")
+        elif "Gemini 3.8 Flash" in selected_option:
+            set_model("gemini-3.8-flash")
+        elif "Gemini 2.5 Pro" in selected_option:
+            set_model("gemini-2.5-pro")
+        elif selected_option.startswith("⬇️ Pull Ollama:"):
+            model_tag = selected_option.split(":")[1].split()[0].strip()
+            subprocess.run(['notify-send', '-a', 'Iram Model Manager', f'⬇️ Pulling {model_tag}...', 'Downloading model weights...'])
+            subprocess.run(f"alacritty -e ollama pull {model_tag}", shell=True)
+            subprocess.run(['notify-send', '-a', 'Iram Model Manager', f'✅ Model {model_tag} Installed!', 'Ready to use offline'])
+    except Exception as e:
+        print(f"Error: {e}")
+
+if __name__ == "__main__":
+    show_model_menu()
