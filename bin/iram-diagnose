@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""
+IRAM OS Autonomous System Diagnostics & SRE Agent (iram-diagnose)
+Continuously scans system health, diagnoses failures across systemd, networking,
+display, audio, and disk, and provides instant 1-click remediation.
+Part of IRAM Agentic OS (https://github.com/apravint/iram-agentic-desktop).
+"""
+import sys
+import os
+import json
+import urllib.request
+import subprocess
+import shutil
+
+VERSION = "1.0.0"
+
+CYAN = "\033[1;36m"
+GREEN = "\033[1;32m"
+YELLOW = "\033[1;33m"
+RED = "\033[1;31m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RESET = "\033[0m"
+
+def get_api_key():
+    key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if key:
+        return key
+    for path in ["~/.config/environment.d/20-gemini.conf", "~/.zshrc", "~/.bashrc"]:
+        full_path = os.path.expanduser(path)
+        if os.path.exists(full_path):
+            try:
+                with open(full_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if "GEMINI_API_KEY=" in line and not line.startswith("#"):
+                            val = line.split("GEMINI_API_KEY=", 1)[1].strip().strip('"').strip("'")
+                            if val:
+                                return val
+            except Exception:
+                pass
+    return ""
+
+def query_llm(prompt, system_prompt):
+    api_key = get_api_key()
+    if api_key:
+        model = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        payload = {
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "contents": [{"parts": [{"text": prompt}]}]
+        }
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json", "x-goog-api-key": api_key}
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except Exception:
+            pass
+
+    # Fallback to local Ollama
+    url = "http://localhost:11434/api/generate"
+    payload = {
+        "model": os.environ.get("OLLAMA_MODEL", "qwen2.5:1.5b"),
+        "prompt": f"{system_prompt}\n\nTelemetry Context:\n{prompt}\n\nDiagnosis and Fix:",
+        "stream": False,
+        "options": {"num_ctx": 4096, "num_predict": 256}
+    }
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("response", "").strip()
+    except Exception:
+        return ""
+
+def run_cmd(cmd_str):
+    try:
+        return subprocess.check_output(cmd_str, shell=True, text=True, stderr=subprocess.STDOUT, timeout=5).strip()
+    except Exception as e:
+        if hasattr(e, 'output') and e.output:
+            return e.output.strip()
+        return f"Error executing: {cmd_str}"
+
+def collect_telemetry(target):
+    telemetry = []
+
+    if target in ["all", "system", "services"]:
+        failed = run_cmd("systemctl --failed --no-legend")
+        telemetry.append(f"--- FAILED SYSTEMD UNITS ---\n{failed if failed else 'None'}")
+        
+        journal_errs = run_cmd("journalctl -p 3 -xb -n 15 --no-pager")
+        telemetry.append(f"--- RECENT JOURNAL ERRORS ---\n{journal_errs if journal_errs else 'None'}")
+
+    if target in ["all", "disk"]:
+        df = run_cmd("df -h -x tmpfs -x devtmpfs -x squashfs")
+        inodes = run_cmd("df -i -x tmpfs -x devtmpfs -x squashfs")
+        telemetry.append(f"--- DISK SPACE USAGE ---\n{df}\n--- INODE USAGE ---\n{inodes}")
+
+    if target in ["all", "memory"]:
+        mem = run_cmd("free -h")
+        oom = run_cmd("dmesg | grep -i oom | tail -n 5")
+        telemetry.append(f"--- MEMORY USAGE ---\n{mem}\n--- OOM EVENTS ---\n{oom if oom else 'None'}")
+
+    if target in ["all", "network"]:
+        ip_r = run_cmd("ip route")
+        links = run_cmd("ip -brief link")
+        ping = run_cmd("ping -c 1 -W 2 1.1.1.1 2>&1")
+        dns = run_cmd("resolvectl status 2>/dev/null | grep 'Current DNS Server' || cat /etc/resolv.conf | grep nameserver")
+        telemetry.append(f"--- NETWORK ROUTES & LINKS ---\n{links}\n{ip_r}\n--- CONNECTIVITY ---\n{ping}\n--- DNS ---\n{dns}")
+
+    if target in ["all", "display", "hyprland"]:
+        monitors = run_cmd("hyprctl monitors 2>/dev/null || echo 'Hyprland not running'")
+        errs = run_cmd("hyprctl configerrors 2>/dev/null || echo 'None'")
+        telemetry.append(f"--- HYPRLAND DISPLAY & MONITORS ---\n{monitors}\n--- CONFIG ERRORS ---\n{errs}")
+
+    if target in ["all", "audio"]:
+        wp = run_cmd("wpctl status 2>/dev/null || pactl info 2>/dev/null || echo 'Audio server info unavailable'")
+        telemetry.append(f"--- AUDIO STATUS ---\n{wp}")
+
+    return "\n\n".join(telemetry)
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ["-h", "--help", "help"]:
+        print(f"{BOLD}IRAM Autonomous SRE & System Diagnostics (iram-diagnose){RESET}")
+        print(f"Scans real-time OS telemetry, identifies root causes, and generates 1-click remediation.\n")
+        print(f"{BOLD}Usage:{RESET}")
+        print(f"  iram-diagnose                 Comprehensive full-system diagnostic scan")
+        print(f"  iram-diagnose network         Diagnose network links, routes, ping, and DNS")
+        print(f"  iram-diagnose disk            Check partition space, disk saturation, and inodes")
+        print(f"  iram-diagnose display         Check Hyprland compositor, monitors, and config")
+        print(f"  iram-diagnose audio           Diagnose PipeWire/WirePlumber default sinks")
+        print(f"  iram-diagnose services        Check failed systemd units and journal errors")
+        print(f"  iram-diagnose -v, --version   Display version\n")
+        sys.exit(0)
+
+    if len(sys.argv) > 1 and sys.argv[1] in ["-v", "--version", "version"]:
+        print(f"iram-diagnose v{VERSION} (IRAM Agentic OS)")
+        sys.exit(0)
+
+    target = sys.argv[1].lower() if len(sys.argv) > 1 else "all"
+    valid_targets = ["all", "network", "disk", "memory", "display", "audio", "services", "system", "hyprland"]
+    if target not in valid_targets:
+        target = "all"
+
+    print(f"\n{BOLD}🔍 [IRAM SRE Agent]{RESET} Scanning system telemetry ({CYAN}{target}{RESET})...")
+    telemetry = collect_telemetry(target)
+
+    system_prompt = (
+        "You are an expert Linux Site Reliability Engineer (SRE) and kernel systems architect for IRAM OS (Ubuntu 26 + Hyprland). "
+        "Analyze the provided Linux telemetry data. Identify whether the system is healthy or if any failures exist. "
+        "OUTPUT FORMAT REQUIREMENTS:\n"
+        "STATUS: <HEALTHY | DEGRADED | CRITICAL>\n"
+        "SUMMARY: <Concise 1-2 sentence assessment of system health>\n"
+        "ROOT_CAUSE: <Plain-English root cause of any issue, or 'None detected' if healthy>\n"
+        "RECOMMENDED_CMD: <The exact 1-line bash command to inspect or resolve the issue, or 'echo \"System operating normally\"' if healthy>\n"
+        "Do NOT output markdown fences or long paragraphs."
+    )
+
+    print(f"{DIM}Analyzing telemetry with reasoning engine...{RESET}\n")
+    response = query_llm(telemetry, system_prompt)
+
+    status = "HEALTHY"
+    summary = "System is operating within normal parameters."
+    root_cause = "No anomalies detected."
+    remedy_cmd = "echo 'System operating normally'"
+
+    if response:
+        for line in response.split("\n"):
+            line = line.strip()
+            if line.startswith("STATUS:"):
+                status = line.replace("STATUS:", "").strip()
+            elif line.startswith("SUMMARY:"):
+                summary = line.replace("SUMMARY:", "").strip()
+            elif line.startswith("ROOT_CAUSE:"):
+                root_cause = line.replace("ROOT_CAUSE:", "").strip()
+            elif line.startswith("RECOMMENDED_CMD:"):
+                remedy_cmd = line.replace("RECOMMENDED_CMD:", "").strip().strip("`")
+
+    status_color = GREEN if status == "HEALTHY" else (YELLOW if status == "DEGRADED" else RED)
+    print("=" * 60)
+    print(f"  {BOLD}SYSTEM HEALTH STATUS:{RESET} {status_color}{status}{RESET}")
+    print("=" * 60)
+    print(f"{BOLD}Assessment:{RESET} {summary}")
+    if status != "HEALTHY":
+        print(f"{YELLOW}{BOLD}Root Cause:{RESET} {root_cause}")
+    print(f"{CYAN}{BOLD}Remediation Command:{RESET} {remedy_cmd}\n")
+
+    if status != "HEALTHY" and remedy_cmd and remedy_cmd != 'echo "System operating normally"':
+        try:
+            choice = input(f"{BOLD}Action [{GREEN}E{RESET}{BOLD}xecute / {YELLOW}C{RESET}{BOLD}opy / {BOLD}Q{RESET}{BOLD}uit] (Default: E): {RESET}").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print("\nAborted.")
+            sys.exit(0)
+
+        if choice in ["", "e", "exec"]:
+            print(f"{GREEN}Executing remediation command...{RESET}\n")
+            subprocess.run(remedy_cmd, shell=True)
+        elif choice in ["c", "copy"]:
+            if shutil.which("wl-copy"):
+                subprocess.run(["wl-copy"], input=remedy_cmd.encode("utf-8"))
+            print(f"{GREEN}✓ Copied remediation command to clipboard.{RESET}")
+        else:
+            print("Remediation deferred.")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# IRAM OS - SDDM Login Screen Scaling & Layout Synchronizer
+# Disables distorted HiDPI scaling and synchronizes native 1080p resolution to SDDM
+set -euo pipefail
+
+# If not running as root, re-run with pkexec or sudo
+if [[ $EUID -ne 0 ]]; then
+    if command -v pkexec >/dev/null 2>&1 && [[ -n "${WAYLAND_DISPLAY:-}" || -n "${DISPLAY:-}" ]]; then
+        exec pkexec "$0" "$@"
+    else
+        exec sudo "$0" "$@"
+    fi
+fi
+
+echo "==> Configuring SDDM Native Resolution (Disabling HiDPI Scaling)..."
+mkdir -p /etc/sddm.conf.d
+cat << 'EOF' > /etc/sddm.conf.d/00-hidpi.conf
+[General]
+EnableHiDPI=false
+GreeterEnvironment=QT_WAYLAND_SHELL_INTEGRATION=layer-shell,QT_ENABLE_HIGHDPI_SCALING=0,QT_SCALE_FACTOR=1,QT_AUTO_SCREEN_SCALE_FACTOR=0
+
+[Wayland]
+EnableHiDPI=false
+EOF
+
+echo "==> Synchronizing display layout to SDDM greeter..."
+if [[ -n "${SUDO_USER:-}" ]]; then
+    TARGET_USER="$SUDO_USER"
+elif [[ -n "${PKEXEC_UID:-}" ]]; then
+    TARGET_USER="$(id -nu "$PKEXEC_UID")"
+else
+    TARGET_USER="apravint"
+fi
+USER_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
+
+if [[ -f "$USER_HOME/.config/kwinoutputconfig.json" ]] && [[ -d /var/lib/sddm ]]; then
+    mkdir -p /var/lib/sddm/.config
+    cp "$USER_HOME/.config/kwinoutputconfig.json" /var/lib/sddm/.config/kwinoutputconfig.json
+    chown -R sddm:sddm /var/lib/sddm/.config
+    echo "==> KWin display configuration copied to SDDM successfully."
+fi
+
+echo "==> SDDM display scaling synchronized! Login screen will now fit at native 1080p."
